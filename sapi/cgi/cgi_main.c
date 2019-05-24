@@ -55,6 +55,9 @@
 #if HAVE_SYS_WAIT_H
 #include <sys/wait.h>
 #endif
+#if HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
 #include "zend.h"
 #include "zend_extensions.h"
 #include "php_ini.h"
@@ -82,6 +85,11 @@ int __riscosify_control = __RISCOSIFY_STRICT_UNIX_SPECS;
 
 #if PHP_FASTCGI
 #include "fastcgi.h"
+
+#if PHP_FASTCGI_PM
+#include "fpm/fpm.h"
+#include "fpm/fpm_request.h"
+#endif
 
 #ifndef PHP_WIN32
 /* XXX this will need to change later when threaded fastcgi is
@@ -115,7 +123,11 @@ static int parent_waiting = 0;
 static pid_t pgroup;
 #endif
 
+static int request_body_fd;
+
 #endif
+
+static char *sapi_cgibin_getenv(char *name, size_t name_len TSRMLS_DC);
 
 #define PHP_MODE_STANDARD	1
 #define PHP_MODE_HIGHLIGHT	2
@@ -146,6 +158,10 @@ static const opt_struct OPTIONS[] = {
 	{'w', 0, "strip"},
 	{'?', 0, "usage"},/* help alias (both '?' and 'usage') */
 	{'v', 0, "version"},
+#if PHP_FASTCGI_PM
+	{'x', 0, "fpm"},
+	{'y', 1, "fpm-config"},
+#endif
 	{'z', 1, "zend-extension"},
 #if PHP_FASTCGI
  	{'T', 1, "timing"},
@@ -170,6 +186,7 @@ typedef struct _php_cgi_globals_struct {
 	zend_bool impersonate;
 # endif
 #endif
+	char *error_header;
 } php_cgi_globals_struct;
 
 #ifdef ZTS
@@ -474,7 +491,28 @@ static int sapi_cgi_read_post(char *buffer, uint count_bytes TSRMLS_DC)
 #if PHP_FASTCGI
 		if (fcgi_is_fastcgi()) {
 			fcgi_request *request = (fcgi_request*) SG(server_context);
-			tmp_read_bytes = fcgi_read(request, buffer + read_bytes, count_bytes - read_bytes);
+
+			if (request_body_fd == -1) {
+				char *request_body_filename = sapi_cgibin_getenv((char *) "REQUEST_BODY_FILE",
+						sizeof("REQUEST_BODY_FILE")-1 TSRMLS_CC);
+
+				if (request_body_filename && *request_body_filename) {
+					request_body_fd = open(request_body_filename, O_RDONLY);
+
+					if (0 > request_body_fd) {
+						php_error(E_WARNING, "REQUEST_BODY_FILE: open('%s') failed: %s (%d)",
+								request_body_filename, strerror(errno), errno);
+						return 0;
+					}
+				}
+			}
+
+			/* If REQUEST_BODY_FILE variable not available - read post body from fastcgi stream */
+			if (request_body_fd < 0) {
+				tmp_read_bytes = fcgi_read(request, buffer + read_bytes, count_bytes - read_bytes);
+			} else {
+				tmp_read_bytes = read(request_body_fd, buffer + read_bytes, count_bytes - read_bytes);
+			}
 		} else {
 			tmp_read_bytes = read(STDIN_FILENO, buffer + read_bytes, count_bytes - read_bytes);
 		}
@@ -786,7 +824,12 @@ static void php_cgi_usage(char *argv0)
 			   "  -s               Display colour syntax highlighted source.\n"
 			   "  -v               Version number\n"
 			   "  -w               Display source with stripped comments and whitespace.\n"
-			   "  -z <file>        Load Zend extension <file>.\n"
+#if PHP_FASTCGI_PM
+			   "  -x, --fpm        Run in FastCGI process manager mode.\n"
+			   "  -y, --fpm-config <file>\n"
+			   "                   Specify alternative path to FastCGI process manager config file.\n"
+#endif
+ 			   "  -z <file>        Load Zend extension <file>.\n"
 #if PHP_FASTCGI
 			   "  -T <count>       Measure execution time of script repeated <count> times.\n"
 #endif
@@ -1236,6 +1279,7 @@ PHP_INI_BEGIN()
 # ifdef PHP_WIN32
 	STD_PHP_INI_ENTRY("fastcgi.impersonate",     "0",  PHP_INI_SYSTEM, OnUpdateBool,   impersonate, php_cgi_globals_struct, php_cgi_globals)
 # endif
+	STD_PHP_INI_ENTRY("fastcgi.error_header",    NULL, PHP_INI_SYSTEM, OnUpdateString, error_header, php_cgi_globals_struct, php_cgi_globals)
 #endif
 PHP_INI_END()
 
@@ -1258,6 +1302,7 @@ static void php_cgi_globals_ctor(php_cgi_globals_struct *php_cgi_globals TSRMLS_
 # ifdef PHP_WIN32
 	php_cgi_globals->impersonate = 0;
 # endif
+	php_cgi_globals->error_header = NULL;
 #endif
 }
 /* }}} */
@@ -1290,8 +1335,46 @@ static PHP_MSHUTDOWN_FUNCTION(cgi)
 static PHP_MINFO_FUNCTION(cgi)
 {
 	DISPLAY_INI_ENTRIES();
+
+#if PHP_FASTCGI_PM
+
+#include "fpm/fpm_autoconf.h"
+
+	php_info_print_table_start();
+	php_info_print_table_row(2, "php-fpm", fpm ? "active" : "inactive");
+	php_info_print_table_row(2, "php-fpm version", PHP_FPM_VERSION);
+	php_info_print_table_end();
+#endif
+
 }
 /* }}} */
+
+#if PHP_FASTCGI
+PHP_FUNCTION(fastcgi_finish_request)
+{
+	fcgi_request *request = (fcgi_request*) SG(server_context);
+
+	if (fcgi_is_fastcgi() && request->fd >= 0) {
+
+		php_end_ob_buffers(1 TSRMLS_CC);
+		php_header(TSRMLS_C);
+
+		fcgi_flush(request, 1);
+		fcgi_close(request, 0, 0);
+		RETURN_TRUE;
+	}
+
+	RETURN_FALSE;
+
+}
+#endif
+
+function_entry cgi_fcgi_sapi_functions[] = {
+#if PHP_FASTCGI
+	PHP_FE(fastcgi_finish_request,				NULL)
+#endif
+	{NULL, NULL, NULL}
+};
 
 static zend_module_entry cgi_module_entry = {
 	STANDARD_MODULE_HEADER,
@@ -1300,7 +1383,7 @@ static zend_module_entry cgi_module_entry = {
 #else
 	"cgi",
 #endif
-	NULL, 
+	cgi_fcgi_sapi_functions, 
 	PHP_MINIT(cgi), 
 	PHP_MSHUTDOWN(cgi), 
 	NULL, 
@@ -1340,6 +1423,7 @@ int main(int argc, char *argv[])
 	char *bindpath = NULL;
 	int fcgi_fd = 0;
 	fcgi_request request;
+	char *fpm_config = NULL;
 	int repeats = 1;
 	int benchmark = 0;
 #if HAVE_GETTIMEOFDAY
@@ -1460,6 +1544,14 @@ int main(int argc, char *argv[])
 			case 's': /* generate highlighted HTML from source */
 				behavior = PHP_MODE_HIGHLIGHT;
 				break;
+#if PHP_FASTCGI_PM
+			case 'y':
+				fpm_config = php_optarg;
+				break;
+			case 'x':
+				fpm = 1;
+				break;
+#endif
 
 		}
 
@@ -1524,6 +1616,19 @@ consult the installation file that came with this distribution, or visit \n\
 #endif	/* FORCE_CGI_REDIRECT */
 
 #if PHP_FASTCGI
+#if PHP_FASTCGI_PM
+	if (fpm) {
+		if (0 > fpm_init(argc, argv, fpm_config)) {
+			return FAILURE;
+		}
+
+		fcgi_fd = fpm_run(&max_requests);
+
+		fcgi_set_is_fastcgi(fastcgi = 1);
+	}
+	else
+#endif
+
 	if (bindpath) {
 		fcgi_fd = fcgi_listen(bindpath, 128);
 		if (fcgi_fd < 0) {
@@ -1538,6 +1643,9 @@ consult the installation file that came with this distribution, or visit \n\
 	
 	if (fastcgi) {
 		/* How many times to run PHP scripts before dying */
+#if PHP_FASTCGI_PM
+		if (!fpm)
+#endif
 		if (getenv("PHP_FCGI_MAX_REQUESTS")) {
 			max_requests = atoi(getenv("PHP_FCGI_MAX_REQUESTS"));
 			if (max_requests < 0) {
@@ -1555,6 +1663,9 @@ consult the installation file that came with this distribution, or visit \n\
 
 #ifndef PHP_WIN32
 	/* Pre-fork, if required */
+#if PHP_FASTCGI_PM
+	if (!fpm)
+#endif
 	if (getenv("PHP_FCGI_CHILDREN")) {
 		char * children_str = getenv("PHP_FCGI_CHILDREN");
 		children = atoi(children_str);
@@ -1704,12 +1815,18 @@ consult the installation file that came with this distribution, or visit \n\
 #endif
 
 #if PHP_FASTCGI
+		request_body_fd = -1;
+
 		SG(server_context) = (void *) &request;
 #else
 		SG(server_context) = (void *) 1; /* avoid server_context==NULL checks */
 #endif
 		init_request_info(TSRMLS_C);
 		CG(interactive) = 0;
+
+#if PHP_FASTCGI_PM
+		if (fpm) fpm_request_info();
+#endif
 
 		if (!cgi
 #if PHP_FASTCGI
@@ -1994,6 +2111,10 @@ consult the installation file that came with this distribution, or visit \n\
 			}
 		}
 
+#if PHP_FASTCGI_PM
+		if (fpm) fpm_request_executing();
+#endif
+
 		switch (behavior) {
 			case PHP_MODE_STANDARD:
 				php_execute_script(&file_handle TSRMLS_CC);
@@ -2046,6 +2167,10 @@ consult the installation file that came with this distribution, or visit \n\
 
 #if PHP_FASTCGI
 fastcgi_request_done:
+
+		if (request_body_fd != -1) close(request_body_fd);
+
+		request_body_fd = -2;
 #endif
 		{
 			char *path_translated;
@@ -2059,6 +2184,16 @@ fastcgi_request_done:
 				SG(request_info).path_translated = path_translated;
 			}
 
+			if (EG(exit_status) == 255) {
+				if (CGIG(error_header) && *CGIG(error_header)) {
+					sapi_header_line ctr = {0};
+
+					ctr.line = CGIG(error_header);
+					ctr.line_len = strlen(CGIG(error_header));
+					sapi_header_op(SAPI_HEADER_REPLACE, &ctr TSRMLS_CC);
+				}
+			}
+			
 			php_request_shutdown((void *) 0);
 			if (exit_status == 0) {
 				exit_status = EG(exit_status);
@@ -2096,15 +2231,20 @@ fastcgi_request_done:
 				if (bindpath) {
 					free(bindpath);
 				}
-				if (max_requests != 1) {
-					/* no need to return exit_status of the last request */
-					exit_status = 0;
-				}
 				break;
 			}
 			/* end of fastcgi loop */
 		}
 		fcgi_shutdown();
+
+		if (fcgi_in_shutdown() || 								/* graceful shutdown by a signal */
+				(max_requests && (requests == max_requests))	/* we were told to process max_requests and we are done */
+			) {
+			exit_status = 0;
+		}
+		else {
+			exit_status = 255;
+		}
 #endif
 
 		if (cgi_sapi_module.php_ini_path_override) {

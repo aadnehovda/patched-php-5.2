@@ -27,6 +27,11 @@
 #include <stdarg.h>
 #include <errno.h>
 
+#if PHP_FASTCGI_PM
+#include "fpm/fpm.h"
+#include "fpm/fpm_request.h"
+#endif
+
 #ifdef _WIN32
 
 #include <windows.h>
@@ -234,6 +239,8 @@ int fcgi_init(void)
 		} else {
 			return is_fastcgi = 0;
 		}
+
+		fcgi_set_allowed_clients(getenv("FCGI_WEB_SERVER_ADDRS"));
 #endif
 	}
 	return is_fastcgi;
@@ -249,14 +256,26 @@ int fcgi_is_fastcgi(void)
 	}
 }
 
+void fcgi_set_is_fastcgi(int new_value)
+{
+	is_fastcgi = new_value;
+}
+
+void fcgi_set_in_shutdown(int new_value)
+{
+	in_shutdown = new_value;
+}
+
 void fcgi_shutdown(void)
 {
 	if (is_initialized) {
 		zend_hash_destroy(&fcgi_mgmt_vars);
 	}
 	is_fastcgi = 0;
+
 	if (allowed_clients) {
 		free(allowed_clients);
+		allowed_clients = 0;
 	}
 }
 
@@ -329,6 +348,41 @@ out_fail:
   return NULL;
 }
 #endif
+
+void fcgi_set_allowed_clients(char *ip)
+{
+    char *cur, *end;
+    int n;
+	    
+    if (ip) {
+    	ip = strdup(ip);
+    	cur = ip;
+    	n = 0;
+    	while (*cur) {
+    		if (*cur == ',') n++;
+    		cur++;
+    	}
+		if (allowed_clients) free(allowed_clients);
+    	allowed_clients = malloc(sizeof(in_addr_t) * (n+2));
+    	n = 0;
+    	cur = ip;
+    	while (cur) {
+	    	end = strchr(cur, ',');
+	    	if (end) {
+    			*end = 0;
+    			end++;
+    		}
+    		allowed_clients[n] = inet_addr(cur);
+    		if (allowed_clients[n] == INADDR_NONE) {
+				fprintf(stderr, "Wrong IP address '%s' in FCGI_WEB_SERVER_ADDRS\n", cur);
+    		}
+    		n++;
+    		cur = end;
+    	}
+    	allowed_clients[n] = INADDR_NONE;
+		free(ip);
+	}
+}
 
 static int is_port_number(const char *bindpath)
 {
@@ -458,38 +512,6 @@ int fcgi_listen(const char *path, int backlog)
 
 	if (!tcp) {
 		chmod(path, 0777);
-	} else {
-			char *ip = getenv("FCGI_WEB_SERVER_ADDRS");
-			char *cur, *end;
-			int n;
-			
-			if (ip) {
-				ip = strdup(ip);
-				cur = ip;
-				n = 0;
-				while (*cur) {
-					if (*cur == ',') n++;
-					cur++;
-				}
-				allowed_clients = malloc(sizeof(in_addr_t) * (n+2));
-				n = 0;
-				cur = ip;
-				while (cur) {
-					end = strchr(cur, ',');
-					if (end) {
-						*end = 0;
-						end++;
-					}
-					allowed_clients[n] = inet_addr(cur);
-					if (allowed_clients[n] == INADDR_NONE) {
-					fprintf(stderr, "Wrong IP address '%s' in FCGI_WEB_SERVER_ADDRS\n", cur);
-					}
-					n++;
-					cur = end;
-				}
-				allowed_clients[n] = INADDR_NONE;
-			free(ip);
-		}
 	}
 
 	if (!is_initialized) {
@@ -866,7 +888,7 @@ int fcgi_read(fcgi_request *req, char *str, int len)
 	return n;
 }
 
-static inline void fcgi_close(fcgi_request *req, int force, int destroy)
+void fcgi_close(fcgi_request *req, int force, int destroy)
 {
 	if (destroy) {
 		zend_hash_destroy(&req->env);
@@ -906,6 +928,10 @@ static inline void fcgi_close(fcgi_request *req, int force, int destroy)
 		close(req->fd);
 #endif
 		req->fd = -1;
+
+#if PHP_FASTCGI_PM
+		if (fpm) fpm_request_finished();
+#endif
 	}
 }
 
@@ -953,6 +979,10 @@ int fcgi_accept_request(fcgi_request *req)
 					sa_t sa;
 					socklen_t len = sizeof(sa);
 
+#if PHP_FASTCGI_PM
+					if (fpm) fpm_request_accepting();
+#endif
+
 					FCGI_LOCK(req->listen_socket);
 					req->fd = accept(listen_socket, (struct sockaddr *)&sa, &len);
 					FCGI_UNLOCK(req->listen_socket);
@@ -988,6 +1018,11 @@ int fcgi_accept_request(fcgi_request *req)
 				break;
 #else
 				if (req->fd >= 0) {
+
+#if PHP_FASTCGI_PM
+					if (fpm) fpm_request_reading_headers();
+#endif
+
 #if defined(HAVE_SYS_POLL_H) && defined(HAVE_POLL)
 					struct pollfd fds;
 					int ret;
