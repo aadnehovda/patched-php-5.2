@@ -1,0 +1,36 @@
+#!/bin/env bash
+
+$(dirname $0)/configure \
+	--prefix=/opt/php52_fpm \
+	--enable-fpm \
+	--disable-shared \
+	--enable-fastcgi \
+	--enable-mbstring \
+	--with-mysqli \
+	--with-curl \
+	--with-zlib \
+	--with-gd \
+	--with-openssl \
+	--with-libdir=lib64 \
+	--with-bz2 \
+	--with-mhash \
+	--enable-zip \
+	--with-layout=GNU \
+	--disable-cli \
+	--enable-bcmath \
+	--enable-calendar \
+	--enable-exif \
+	--enable-ftp \
+	--with-gettext \
+	--with-imap \
+	--with-mysql \
+	--enable-soap \
+	--enable-sockets \
+	--enable-sysvmsg \
+	--enable-sysvsem \
+	--enable-sysvshm \
+	--enable-wddx \
+	--with-kerberos \
+	--with-imap-ssl \
+	--with-pdo-mysql \
+	--with-freetype-dir
